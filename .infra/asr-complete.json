@@ -1,0 +1,186 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+
+  "parameters": {
+    "vmName": { "type": "string", "defaultValue": "vm-rsv" },
+    "vmSize": { "type": "string", "defaultValue": "Standard_D2s_v3" },
+    "adminUsername": { "type": "string" },
+    "adminPassword": { "type": "secureString" },
+
+    "primaryRegion": { "type": "string", "defaultValue": "Korea Central" },
+    "secondaryRegion": { "type": "string", "defaultValue": "East US" },
+
+    "vaultName": { "type": "string", "defaultValue": "dr-vault-eastus" },
+    "policyName": { "type": "string", "defaultValue": "24-hour-retention-policy" }
+  },
+
+  "variables": {
+    "vnetName": "primary-vnet",
+    "subnetName": "default",
+    "pipName": "vmPublicIP",
+    "nicName": "vmNIC",
+    "vaultId": "[resourceId('Microsoft.RecoveryServices/vaults', parameters('vaultName'))]"
+  },
+
+  "resources": [
+
+    /* ------------------------------------------------------------
+       1. Create VNET in PRIMARY Region
+    ------------------------------------------------------------ */
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2022-01-01",
+      "name": "[variables('vnetName')]",
+      "location": "[parameters('primaryRegion')]",
+      "properties": {
+        "addressSpace": { "addressPrefixes": [ "10.0.0.0/16" ] },
+        "subnets": [
+          {
+            "name": "[variables('subnetName')]",
+            "properties": {
+              "addressPrefix": "10.0.0.0/24"
+            }
+          }
+        ]
+      }
+    },
+
+    /* ------------------------------------------------------------
+       2. Public IP
+    ------------------------------------------------------------ */
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2022-01-01",
+      "name": "[variables('pipName')]",
+      "location": "[parameters('primaryRegion')]",
+      "properties": {
+        "publicIPAllocationMethod": "Dynamic"
+      }
+    },
+
+    /* ------------------------------------------------------------
+       3. NIC
+    ------------------------------------------------------------ */
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2022-01-01",
+      "name": "[variables('nicName')]",
+      "location": "[parameters('primaryRegion')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('vnetName'))]",
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('pipName'))]"
+      ],
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipConfig1",
+            "properties": {
+              "subnet": {
+                "id": "[resourceId('Microsoft.Network/virtualNetworks/subnets', variables('vnetName'), variables('subnetName'))]"
+              },
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('pipName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+
+    /* ------------------------------------------------------------
+       4. Create VM in PRIMARY Region
+    ------------------------------------------------------------ */
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2023-03-01",
+      "name": "[parameters('vmName')]",
+      "location": "[parameters('primaryRegion')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "[parameters('vmSize')]"
+        },
+        "osProfile": {
+          "computerName": "[parameters('vmName')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "adminPassword": "[parameters('adminPassword')]"
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "MicrosoftWindowsServer",
+            "offer": "WindowsServer",
+            "sku": "2022-datacenter",
+            "version": "latest"
+          },
+          "osDisk": {
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "StandardSSD_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+            }
+          ]
+        }
+      }
+    },
+
+    /* ------------------------------------------------------------
+       5. Create Recovery Services Vault in DR region
+    ------------------------------------------------------------ */
+    {
+      "type": "Microsoft.RecoveryServices/vaults",
+      "apiVersion": "2022-10-01",
+      "name": "[parameters('vaultName')]",
+      "location": "[parameters('secondaryRegion')]",
+      "sku": { "name": "Standard" },
+      "properties": {}
+    },
+
+    /* ------------------------------------------------------------
+       6. Create Replication Policy
+    ------------------------------------------------------------ */
+    {
+      "type": "Microsoft.RecoveryServices/vaults/replicationPolicies",
+      "apiVersion": "2022-02-01",
+      "name": "[concat(parameters('vaultName'), '/', parameters('policyName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.RecoveryServices/vaults', parameters('vaultName'))]"
+      ],
+      "properties": {
+        "recoveryPointRetentionInHours": 24,
+        "applicationConsistentSnapshotFrequencyInHours": 4,
+        "multiVmSyncStatus": "Disable"
+      }
+    },
+
+    /* ------------------------------------------------------------
+       7. Enable VM Replication (A2A)
+    ------------------------------------------------------------ */
+    {
+      "type": "Microsoft.RecoveryServices/vaults/replicationFabrics/replicationProtectionContainers/replicationProtectedItems",
+      "apiVersion": "2022-02-01",
+      "name": "[concat(parameters('vaultName'), '/asr-a2a-default-koreacentral/asr-a2a-default-koreacentral-container/', parameters('vmName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.RecoveryServices/vaults/replicationPolicies', parameters('vaultName'), parameters('policyName'))]",
+        "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]"
+      ],
+      "properties": {
+        "policyId": "[resourceId('Microsoft.RecoveryServices/vaults/replicationPolicies', parameters('vaultName'), parameters('policyName'))]",
+        "providerSpecificDetails": {
+          "instanceType": "A2A",
+          "fabricObjectId": "[resourceId('Microsoft.Compute/virtualMachines', parameters('vmName'))]",
+          "recoveryAzureNetworkId": "[parameters('targetVnetId')]"
+        }
+      }
+    }
+
+  ]
+}
